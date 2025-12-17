@@ -728,7 +728,12 @@ class base {
         if (empty($idtoken)) {
             return '';
         }
-
+		
+		$usercode = $idtoken->claim('usercode');
+		if (!empty($usercode)) {
+			return strtolower($usercode);
+		}
+		
         if (empty($bindingusernameclaim)) {
             $bindingusernameclaim = get_config('auth_oidc', 'bindingusernameclaim');
             if (empty($bindingusernameclaim)) {
