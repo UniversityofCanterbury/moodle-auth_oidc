@@ -29,6 +29,8 @@ namespace auth_oidc\loginflow;
 use auth_oidc\jwt;
 use auth_oidc\oidcclient;
 use auth_oidc\utils;
+use core\context\system;
+use core\url;
 use core_user;
 use moodle_exception;
 use stdClass;
@@ -98,6 +100,35 @@ class base {
     }
 
     /**
+     * Determine whether the user belongs to an additional tenant, whose fields can only be synced from the token.
+     *
+     * A user is treated as coming from the hosting tenant unless the token's tenant ID is missing or differs from the
+     * hosting tenant ID. The hosting tenant ID is only stored in local_o365 after the admin consent flow completes, so until
+     * then the tenant ID in the configured authorization endpoint is used instead. If neither is known, the user cannot be
+     * identified as coming from an additional tenant.
+     *
+     * @param jwt $token The user's access token.
+     * @return bool True if the user should only sync fields from the token.
+     */
+    protected function is_user_from_additional_tenant(jwt $token): bool {
+        $tokentenantid = $token->claim('tid');
+        if (empty($tokentenantid)) {
+            return true;
+        }
+
+        $hostingtenantid = get_config('local_o365', 'entratenantid');
+        if (empty($hostingtenantid)) {
+            $authendpoint = (string) get_config('auth_oidc', 'authendpoint');
+            $guidpattern = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}';
+            if (preg_match('#^https://login\.microsoftonline\.com/(' . $guidpattern . ')/#i', $authendpoint, $matches)) {
+                $hostingtenantid = $matches[1];
+            }
+        }
+
+        return !empty($hostingtenantid) && strtolower($tokentenantid) !== strtolower($hostingtenantid);
+    }
+
+    /**
      * Read user information from external database and returns it as array().
      *
      * @param string $username username
@@ -122,25 +153,50 @@ class base {
         $fieldmappingfromtoken = true;
 
         if (auth_oidc_is_local_365_installed()) {
-            // Check if multi tenants is enabled. User from additional tenants can only sync fields from token.
-            $userfromadditionaltenant = false;
-            $hostingtenantid = get_config('local_o365', 'entratenantid');
-            $token = jwt::instance_from_encoded($tokenrec->token);
-            if ($token->claim('tid') != $hostingtenantid) {
-                $userfromadditionaltenant = true;
+            // User from additional tenants can only sync fields from token.
+            // Read the tenant id from the access token, falling back to the ID token: in real Entra
+            // flows the access token can be opaque while the ID token is still a JWT carrying 'tid'.
+            $tenanttoken = null;
+            foreach (['token', 'idtoken'] as $tokenname) {
+                try {
+                    $tenanttoken = jwt::instance_from_encoded($tokenrec->$tokenname);
+                    break;
+                } catch (moodle_exception $e) {
+                    // Not a readable JWT (e.g. an opaque access token): try the next token.
+                    $tenanttoken = null;
+                }
             }
+            // Only classify as an additional-tenant user when the tenant id could actually be read;
+            // if neither token is decodable, fall back to treating the user as the hosting tenant.
+            $userfromadditionaltenant = $tenanttoken !== null && $this->is_user_from_additional_tenant($tenanttoken);
 
             if (!$userfromadditionaltenant) {
                 $userdatafetchedfromgraph = false;
                 if (\local_o365\feature\usersync\main::fieldmap_require_graph_api_call($eventtype)) {
                     // If local_o365 is installed, and connects to Microsoft Identity Platform (v2.0),
                     // or field mapping uses fields not covered by token, then call Graph API function to get user details.
-                    $apiclient = \local_o365\utils::get_api();
+                    try {
+                        $apiclient = \local_o365\utils::get_api();
+                    } catch (moodle_exception $e) {
+                        // No application token available (e.g. admin consent not completed), fall back to token data.
+                        $apiclient = null;
+                    }
                     if ($apiclient) {
                         $fieldmappingfromtoken = false;
                         $userdata = $apiclient->get_user($tokenrec->oidcuniqid);
                         if ($userdata) {
                             $userdatafetchedfromgraph = true;
+                            // Add custom claims from tokens even when using Graph API.
+                            $tokenames = ['idtoken', 'token'];
+                            foreach ($tokenames as $tokename) {
+                                try {
+                                    $token = jwt::instance_from_encoded($tokenrec->$tokename);
+                                    $this->add_configured_custom_claims_to_userdata($userdata, $token);
+                                } catch (moodle_exception $e) {
+                                    // Error occurred when decoding a token, skip.
+                                    continue;
+                                }
+                            }
                         }
                     }
                 }
@@ -148,11 +204,18 @@ class base {
                 if (!$userdatafetchedfromgraph) {
                     // If local_o365 is installed, but all field mapping fields are in token, then use token.
                     $fieldmappingfromtoken = false;
-                    // Process both ID token and access tokens.
+                    // Process both ID token and access tokens. Initialise the collected user data so the
+                    // fieldmap call below is safe even when every token is skipped because it cannot be decoded.
+                    $userdata = [];
                     $tokenames = ['idtoken', 'token'];
 
                     foreach ($tokenames as $tokename) {
-                        $token = jwt::instance_from_encoded($tokenrec->$tokename);
+                        try {
+                            $token = jwt::instance_from_encoded($tokenrec->$tokename);
+                        } catch (moodle_exception $e) {
+                            // Error occurred when decoding a token, skip.
+                            continue;
+                        }
 
                         if (!isset($userdata['objectId'])) {
                             $objectid = $token->claim('oid');
@@ -197,13 +260,6 @@ class base {
                             $email = $token->claim('email');
                             if (!empty($email)) {
                                 $userdata['mail'] = $email;
-                            } else {
-                                if (!empty($upn)) {
-                                    $entraidemailvalidateresult = filter_var($upn, FILTER_VALIDATE_EMAIL);
-                                    if (!empty($entraidemailvalidateresult)) {
-                                        $userdata['mail'] = $entraidemailvalidateresult;
-                                    }
-                                }
                             }
                         }
 
@@ -213,12 +269,25 @@ class base {
                                 $userdata['bindingusernameclaim'] = $token->claim($bindingusernameclaim);
                             }
                         }
+
+                        $this->add_configured_custom_claims_to_userdata($userdata, $token);
                     }
                 }
 
                 // Call the function in local_o365 to map fields.
-                $updateduser = \local_o365\feature\usersync\main::apply_configured_fieldmap($userdata, $originaluser, $eventtype);
-                $userinfo = (array)$updateduser;
+                try {
+                    $updateduser = \local_o365\feature\usersync\main::apply_configured_fieldmap(
+                        $userdata,
+                        $originaluser,
+                        $eventtype
+                    );
+                    $userinfo = (array)$updateduser;
+                    $fieldmappingfromtoken = false;
+                } catch (moodle_exception $e) {
+                    // Graph dependent mappings (manager, groups, teams, roles) failed, e.g. no application token is available.
+                    // Fall back to token based field mapping.
+                    $fieldmappingfromtoken = true;
+                }
             }
         }
 
@@ -284,13 +353,6 @@ class base {
                     $email = $token->claim('email');
                     if (!empty($email)) {
                         $userdata['mail'] = $email;
-                    } else {
-                        if (!empty($upn)) {
-                            $entraidemailvalidateresult = filter_var($upn, FILTER_VALIDATE_EMAIL);
-                            if (!empty($entraidemailvalidateresult)) {
-                                $userdata['mail'] = $entraidemailvalidateresult;
-                            }
-                        }
                     }
                 }
 
@@ -298,6 +360,27 @@ class base {
                     $bindingusernameclaim = auth_oidc_get_binding_username_claim();
                     if (!empty($bindingusernameclaim)) {
                         $userdata['bindingusernameclaim'] = $token->claim($bindingusernameclaim);
+                    }
+                }
+
+                $this->add_configured_custom_claims_to_userdata($userdata, $token);
+            }
+
+            if (empty($userdata['mail'])) {
+                $upn = $userdata['userPrincipalName'] ?? null;
+                $fallbackemail = auth_oidc_upn_as_email($upn);
+                if (!empty($fallbackemail)) {
+                    $userdata['mail'] = $fallbackemail;
+                } else {
+                    $dummyemail = auth_oidc_generate_dummy_email($upn, $userdata['objectId'] ?? null);
+                    if (!empty($dummyemail)) {
+                        $userdata['mail'] = $dummyemail;
+                        \auth_oidc\utils::debug(
+                            'No email address was received from Microsoft for this user; using generated placeholder ' .
+                                'email address "' . $dummyemail . '" instead.',
+                            'auth_oidc\loginflow\base::get_userinfo',
+                            ['username' => $username, 'userPrincipalName' => $upn]
+                        );
                     }
                 }
             }
@@ -325,13 +408,13 @@ class base {
             $remotefield = $fieldmapping['field_map'];
             $behavior = $fieldmapping['update_local'];
 
-            if ($behavior !== 'on' . $eventtype && $behavior !== 'always') {
+            if (!auth_oidc_fieldmap_applies_to_event($behavior, $eventtype)) {
                 // Field mapping doesn't apply to this event type.
                 continue;
             }
 
             if (isset($userdata[$remotefield])) {
-                $user->$localfield = $userdata[$remotefield];
+                $user->$localfield = auth_oidc_trim_user_field_value($localfield, $userdata[$remotefield]);
             }
         }
 
@@ -353,18 +436,23 @@ class base {
      * @param bool $justremovetokens If true, just remove the stored OIDC tokens for the user; otherwise, revert login methods.
      * @param bool $donotremovetokens If true, do not remove tokens when disconnecting. This migrates from a login account
      *                                to a "linked" account.
-     * @param \moodle_url|null $redirect URL to redirect to if successful.
-     * @param \moodle_url|null $selfurl The page this is accessed from, used for some redirects.
+     * @param url|null $redirect URL to redirect to if successful.
+     * @param url|null $selfurl The page this is accessed from, used for some redirects.
      * @param int|null $userid ID of the user to disconnect; uses the current user if not provided.
      */
-    public function disconnect($justremovetokens = false, $donotremovetokens = false, ?\moodle_url $redirect = null,
-            ?\moodle_url $selfurl = null, $userid = null) {
+    public function disconnect(
+        $justremovetokens = false,
+        $donotremovetokens = false,
+        ?url $redirect = null,
+        ?url $selfurl = null,
+        $userid = null
+    ) {
         global $USER, $DB, $CFG;
         if ($redirect === null) {
-            $redirect = new \moodle_url('/auth/oidc/ucp.php');
+            $redirect = new url('/auth/oidc/ucp.php');
         }
         if ($selfurl === null) {
-            $selfurl = new \moodle_url('/auth/oidc/ucp.php', ['action' => 'disconnectlogin']);
+            $selfurl = new url('/auth/oidc/ucp.php', ['action' => 'disconnectlogin']);
         }
 
         // Get the record of the user involved. Current user if no ID received.
@@ -386,9 +474,9 @@ class base {
             redirect($redirect);
         } else {
             global $OUTPUT, $PAGE;
-            require_once($CFG->dirroot.'/user/lib.php');
+            require_once($CFG->dirroot . '/user/lib.php');
             $PAGE->set_url($selfurl->out());
-            $PAGE->set_context(\context_system::instance());
+            $PAGE->set_context(system::instance());
             $PAGE->set_pagelayout('standard');
             $USER->editing = false;
 
@@ -430,12 +518,14 @@ class base {
             if ($mform->is_cancelled()) {
                 redirect($redirect);
             } else if ($fromform = $mform->get_data()) {
-                if (empty($fromform->newmethod) || ($fromform->newmethod !== $prevauthmethod &&
-                        $fromform->newmethod !== 'manual')) {
+                if (
+                    empty($fromform->newmethod) || ($fromform->newmethod !== $prevauthmethod &&
+                    $fromform->newmethod !== 'manual')
+                ) {
                     throw new moodle_exception('errorauthdisconnectinvalidmethod', 'auth_oidc');
                 }
 
-                $updateduser = new stdClass;
+                $updateduser = new stdClass();
 
                 if ($fromform->newmethod === 'manual') {
                     if (empty($fromform->password)) {
@@ -462,7 +552,7 @@ class base {
                     $updateduser->auth = $prevauthmethod;
                     // We can't use user_update_user as it will rehash the value.
                     if (!empty($prevmethodrec->password)) {
-                        $manualuserupdate = new stdClass;
+                        $manualuserupdate = new stdClass();
                         $manualuserupdate->id = $userrec->id;
                         $manualuserupdate->password = $prevmethodrec->password;
                         $DB->update_record('user', $manualuserupdate);
@@ -510,7 +600,6 @@ class base {
      * @return mixed Determined by loginflow.
      */
     public function handleredirect() {
-
     }
 
     /**
@@ -595,7 +684,7 @@ class base {
                     $hasrestrictions = true;
                     ob_start();
                     try {
-                        $pattern = '/'.$restriction.'/';
+                        $pattern = '/' . $restriction . '/';
                         if (isset($this->config->userrestrictionscasesensitive) && !$this->config->userrestrictionscasesensitive) {
                             $pattern .= 'i';
                         }
@@ -640,8 +729,15 @@ class base {
      * @param null|string $originalupn
      * @return stdClass The created token database record.
      */
-    protected function createtoken($oidcuniqid, $username, $authparams, $tokenparams, jwt $idtoken, $userid = 0,
-        $originalupn = null) {
+    protected function createtoken(
+        $oidcuniqid,
+        $username,
+        $authparams,
+        $tokenparams,
+        jwt $idtoken,
+        $userid = 0,
+        $originalupn = null
+    ) {
         global $DB;
 
         if (!is_null($originalupn)) {
@@ -661,6 +757,9 @@ class base {
         // Cleanup old invalid token with the same oidcusername.
         $DB->delete_records('auth_oidc_token', ['oidcusername' => $oidcusername]);
 
+        // Cleanup old token with the same Moodle username to prevent duplicates.
+        $DB->delete_records('auth_oidc_token', ['username' => $username]);
+
         // Handle "The existing token for this user does not contain a valid user ID" error.
         if ($userid == 0) {
             $userrec = $DB->get_record('user', ['username' => $username]);
@@ -669,7 +768,7 @@ class base {
             }
         }
 
-        $tokenrec = new stdClass;
+        $tokenrec = new stdClass();
         $tokenrec->oidcuniqid = $oidcuniqid;
         $tokenrec->username = $username;
         $tokenrec->userid = $userid;
@@ -701,7 +800,7 @@ class base {
      */
     protected function updatetoken($tokenid, $authparams, $tokenparams) {
         global $DB;
-        $tokenrec = new stdClass;
+        $tokenrec = new stdClass();
         $tokenrec->id = $tokenid;
         $tokenrec->authcode = $authparams['code'];
         $tokenrec->token = $tokenparams['access_token'];
@@ -744,7 +843,8 @@ class base {
 
         switch ($bindingusernameclaim) {
             case 'custom':
-                $bindingusernameclaim = get_config('auth_oidc', 'custombindingclaim');
+                $bindingusernameclaim = get_config('auth_oidc', 'customclaimname');
+                // No break.
             case 'preferred_username':
             case 'email':
             case 'upn':
@@ -781,5 +881,34 @@ class base {
         }
 
         return $oidcusername;
+    }
+
+    /**
+     * Add configured custom claims from a token into the user data array.
+     *
+     * @param array $userdata User data array to update.
+     * @param jwt $token The JWT token to extract claims from.
+     */
+    protected function add_configured_custom_claims_to_userdata(array &$userdata, jwt $token): void {
+        $customclaims = auth_oidc_get_validated_custom_claim_names();
+        if (empty($customclaims)) {
+            return;
+        }
+
+        foreach ($customclaims as $claimname) {
+            $claimvalue = auth_oidc_custom_claim_value_to_string($token->claim($claimname));
+            if ($claimvalue === null) {
+                continue;
+            }
+
+            $prefixedkey = auth_oidc_get_custom_claim_prefixed_key($claimname);
+            if (!isset($userdata[$prefixedkey])) {
+                $userdata[$prefixedkey] = $claimvalue;
+            }
+
+            if (!isset($userdata[$claimname])) {
+                $userdata[$claimname] = $claimvalue;
+            }
+        }
     }
 }

@@ -24,19 +24,22 @@
  */
 
 use auth_oidc\form\application;
+use core\context\system;
+use core\url;
 
 require_once(dirname(__FILE__) . '/../../config.php');
 require_once($CFG->libdir . '/adminlib.php');
+require_once($CFG->libdir . '/formslib.php');
 require_once($CFG->dirroot . '/auth/oidc/lib.php');
 
 require_login();
 
-$url = new moodle_url('/auth/oidc/manageapplication.php');
+$url = new url('/auth/oidc/manageapplication.php');
 $PAGE->set_url($url);
-$PAGE->set_context(context_system::instance());
+$PAGE->set_context(system::instance());
 $PAGE->set_pagelayout('admin');
-$PAGE->set_heading(get_string('settings_page_application', 'auth_oidc'));
-$PAGE->set_title(get_string('settings_page_application', 'auth_oidc'));
+$PAGE->set_heading(get_string('settings_page_application_wizard', 'auth_oidc'));
+$PAGE->set_title(get_string('settings_page_application_wizard', 'auth_oidc'));
 
 $jsparams = [AUTH_OIDC_IDP_TYPE_MICROSOFT_IDENTITY_PLATFORM, AUTH_OIDC_AUTH_METHOD_SECRET, AUTH_OIDC_AUTH_METHOD_CERTIFICATE,
     get_string('auth_method_certificate', 'auth_oidc')];
@@ -46,7 +49,7 @@ $jsmodule = [
 ];
 $PAGE->requires->js_init_call('M.auth_oidc.init', $jsparams, true, $jsmodule);
 
-admin_externalpage_setup('auth_oidc_application');
+navigation_node::require_admin_tree();
 
 require_admin();
 
@@ -55,12 +58,39 @@ $oidcconfig = get_config('auth_oidc');
 $form = new application(null, ['oidcconfig' => $oidcconfig]);
 
 $formdata = [];
-foreach (['idptype', 'clientid', 'clientauthmethod', 'clientsecret', 'clientprivatekey', 'clientcert',
-    'clientcertsource', 'clientprivatekeyfile', 'clientcertfile', 'clientcertpassphrase',
-    'authendpoint', 'tokenendpoint', 'oidcresource', 'oidcscope', 'secretexpiryrecipients',
-    'bindingusernameclaim', 'customclaimname'] as $field) {
+$secretfields = ['clientsecret', 'clientcertpassphrase'];
+
+// Check if form was submitted (to handle validation errors).
+$formsubmitted = optional_param('submitbutton', '', PARAM_TEXT);
+
+foreach (
+    [
+        'idptype', 'microsoftcloud', 'clientid', 'clientauthmethod', 'clientsecret', 'clientprivatekey', 'clientcert',
+        'clientcertsource', 'clientprivatekeyfile', 'clientcertfile', 'clientcertpassphrase',
+        'authendpoint', 'tokenendpoint', 'oidcresource', 'oidcscope', 'secretexpiryrecipients',
+        'bindingusernameclaim', 'customclaimname', 'customclaims',
+    ] as $field
+) {
     if (isset($oidcconfig->$field)) {
-        $formdata[$field] = $oidcconfig->$field;
+        // Mask sensitive secret fields for display only.
+        if (in_array($field, $secretfields) && !empty($oidcconfig->$field)) {
+            $formdata[$field] = auth_oidc_mask_secret($oidcconfig->$field);
+        } else {
+            $formdata[$field] = $oidcconfig->$field;
+        }
+    }
+}
+
+// After form validation errors, if the change checkbox wasn't checked, restore the masked value.
+if ($formsubmitted) {
+    $changesecret = optional_param('changesecret', 0, PARAM_BOOL);
+    $changecertpassphrase = optional_param('changecertpassphrase', 0, PARAM_BOOL);
+
+    if (!$changesecret && !empty($oidcconfig->clientsecret)) {
+        $formdata['clientsecret'] = auth_oidc_mask_secret($oidcconfig->clientsecret);
+    }
+    if (!$changecertpassphrase && !empty($oidcconfig->clientcertpassphrase)) {
+        $formdata['clientcertpassphrase'] = auth_oidc_mask_secret($oidcconfig->clientcertpassphrase);
     }
 }
 
@@ -75,14 +105,16 @@ if ($form->is_cancelled()) {
     }
 
     // Prepare config settings to save.
-    $configstosave = ['idptype', 'clientid', 'clientauthmethod', 'authendpoint', 'tokenendpoint',
-        'oidcresource', 'oidcscope'];
+    $configstosave = ['idptype', 'microsoftcloud', 'clientid', 'clientauthmethod', 'authendpoint', 'tokenendpoint',
+        'oidcresource', 'oidcscope', 'customclaims'];
 
     // Depending on the value of clientauthmethod, save clientsecret or (clientprivatekey and clientcert).
     switch ($fromform->clientauthmethod) {
         case AUTH_OIDC_AUTH_METHOD_SECRET:
             $configstosave[] = 'clientsecret';
-            $configstosave[] = 'secretexpiryrecipients';
+            if (isset($fromform->secretexpiryrecipients)) {
+                $configstosave[] = 'secretexpiryrecipients';
+            }
             break;
         case AUTH_OIDC_AUTH_METHOD_CERTIFICATE:
             $configstosave[] = 'clientcertsource';
@@ -105,9 +137,37 @@ if ($form->is_cancelled()) {
     $settingschanged = false;
     foreach ($configstosave as $config) {
         $existingsetting = get_config('auth_oidc', $config);
-        if ($fromform->$config != $existingsetting) {
-            add_to_config_log($config, $existingsetting, $fromform->$config, 'auth_oidc');
-            set_config($config, $fromform->$config, 'auth_oidc');
+        $newvalue = $fromform->$config;
+
+        // Handle secret fields specially.
+        if (in_array($config, $secretfields)) {
+            // If the value is a masked secret and hasn't changed, skip updating it.
+            if (auth_oidc_is_masked_secret($newvalue)) {
+                // Check if the masked value matches what we would have displayed.
+                if ($existingsetting && auth_oidc_mask_secret($existingsetting) === $newvalue) {
+                    // Value hasn't been changed, skip this field.
+                    continue;
+                }
+            }
+
+            // CRITICAL: Prevent saving empty secret when there's an existing one.
+            // This handles cases where the field is disabled and submits empty.
+            if (empty(trim($newvalue)) && !empty($existingsetting)) {
+                // Don't delete existing secret with empty value - skip this field.
+                continue;
+            }
+        }
+
+        if ($newvalue != $existingsetting) {
+            // Redact secret fields in the config log to prevent exposing sensitive values.
+            if (in_array($config, $secretfields)) {
+                $logoldvalue = !empty($existingsetting) ? '[REDACTED]' : '';
+                $lognewvalue = !empty($newvalue) ? '[REDACTED]' : '';
+                add_to_config_log($config, $logoldvalue, $lognewvalue, 'auth_oidc');
+            } else {
+                add_to_config_log($config, $existingsetting, $newvalue, 'auth_oidc');
+            }
+            set_config($config, $newvalue, 'auth_oidc');
             $settingschanged = true;
             if ($config != 'secretexpiryrecipients') {
                 $updateapplicationtokenrequired = true;
@@ -127,11 +187,11 @@ if ($form->is_cancelled()) {
         if ($isgraphapiconnected) {
             // First, delete the existing application token and purge cache.
             unset_config('apptokens', 'local_o365');
-            unset_config('azuresetupresult', 'local_o365');
+            unset_config('verifysetupresult', 'local_o365');
             purge_all_caches();
 
             // Then show the message to the user with instructions to update the application token.
-            $localo365configurl = new moodle_url('/admin/settings.php', ['section' => 'local_o365']);
+            $localo365configurl = new url('/admin/settings.php', ['section' => 'local_o365']);
             redirect($localo365configurl, get_string('application_updated_microsoft', 'auth_oidc'));
         } else {
             redirect($url, get_string('application_updated', 'auth_oidc'));
@@ -144,6 +204,7 @@ if ($form->is_cancelled()) {
 }
 
 echo $OUTPUT->header();
+echo auth_oidc_get_settings_nav_html('authsettingoidc', get_string('settings_page_application_wizard', 'auth_oidc'));
 
 $form->display();
 

@@ -28,12 +28,37 @@ namespace auth_oidc;
 use Exception;
 use moodle_exception;
 use auth_oidc\event\action_failed;
-use moodle_url;
+use core\context\system;
+use core\url;
 
 /**
  * General purpose utility class.
  */
 class utils {
+    /**
+     * Re-emit the session cookie with "SameSite=None; Secure" so it is kept inside a cross-site iframe.
+     *
+     * Since MDL-83526 core sets SameSite=Lax on the session cookie, which browsers reject when the page is
+     * embedded cross-site, e.g. in the Microsoft Teams tab. Must be called after the session id is final
+     * (after complete_user_login()) and before any output is sent.
+     */
+    public static function set_session_cookie_samesite_none(): void {
+        global $CFG;
+
+        if (!is_https() && empty($CFG->sslproxy)) {
+            return;
+        }
+
+        $cookieparams = session_get_cookie_params();
+        setcookie(session_name(), session_id(), [
+            'path' => $cookieparams['path'],
+            'domain' => $cookieparams['domain'],
+            'secure' => true,
+            'httponly' => $cookieparams['httponly'],
+            'samesite' => 'None',
+        ]);
+    }
+
     /**
      * Process an OIDC JSON response.
      *
@@ -55,14 +80,21 @@ class utils {
             if (isset($result['error_description'])) {
                 $isadminconsent = optional_param('admin_consent', false, PARAM_BOOL);
                 if ($isadminconsent) {
-                    if (get_config('auth_oidc', 'idptype') == AUTH_OIDC_IDP_TYPE_MICROSOFT_IDENTITY_PLATFORM &&
+                    if (
+                        get_config('auth_oidc', 'idptype') == AUTH_OIDC_IDP_TYPE_MICROSOFT_IDENTITY_PLATFORM &&
                         auth_oidc_is_local_365_installed() &&
                         $result['error'] === 'invalid_grant' &&
                         isset($result['error_codes']) && count($result['error_codes']) == 1 &&
-                        $result['error_codes'][0] == 53003) {
-                        $localo365configurationpageurl = new moodle_url('/admin/settings.php', ['section' => 'local_o365']);
-                        throw new moodle_exception('settings_adminconsent_error_53003', 'local_o365',
-                            $localo365configurationpageurl, '', $result['error_description']);
+                        $result['error_codes'][0] == 53003
+                    ) {
+                        $localo365configurationpageurl = new url('/admin/settings.php', ['section' => 'local_o365']);
+                        throw new moodle_exception(
+                            'settings_adminconsent_error_53003',
+                            'local_o365',
+                            $localo365configurationpageurl,
+                            '',
+                            $result['error_description']
+                        );
                     }
                 }
                 throw new moodle_exception('erroroidccall_message', 'auth_oidc', '', $result['error_description']);
@@ -73,7 +105,7 @@ class utils {
 
         foreach ($expectedstructure as $key => $val) {
             if (!isset($result[$key])) {
-                $errmsg = 'Invalid structure received. No "'.$key.'"';
+                $errmsg = 'Invalid structure received. No "' . $key . '"';
                 self::debug($errmsg, __METHOD__, $result);
                 throw new moodle_exception('erroroidccall', 'auth_oidc');
             }
@@ -81,7 +113,8 @@ class utils {
             if ($val !== null && $result[$key] !== $val) {
                 $strreceivedval = self::tostring($result[$key]);
                 $strval = self::tostring($val);
-                $errmsg = 'Invalid structure received. Invalid "'.$key.'". Received "'.$strreceivedval.'", expected "'.$strval.'"';
+                $errmsg = 'Invalid structure received. Invalid "' . $key . '". Received "' . $strreceivedval .
+                    '", expected "' . $strval . '"';
                 self::debug($errmsg, __METHOD__, $result);
                 throw new moodle_exception('erroroidccall', 'auth_oidc');
             }
@@ -98,9 +131,9 @@ class utils {
     public static function tostring($val) {
         if (is_scalar($val)) {
             if (is_bool($val)) {
-                return '(bool)'.(string)(int)$val;
+                return '(bool)' . (string)(int)$val;
             } else {
-                return '('.gettype($val).')'.(string)$val;
+                return '(' . gettype($val) . ')' . (string)$val;
             }
         } else if (is_null($val)) {
             return '(null)';
@@ -186,7 +219,7 @@ class utils {
      * @return string The redirect URL.
      */
     public static function get_redirecturl() {
-        $redirecturl = new moodle_url('/auth/oidc/');
+        $redirecturl = new url('/auth/oidc/');
         return $redirecturl->out(false);
     }
 
@@ -196,7 +229,7 @@ class utils {
      * @return string The redirect URL.
      */
     public static function get_frontchannellogouturl() {
-        $logouturl = new moodle_url('/auth/oidc/logout.php');
+        $logouturl = new url('/auth/oidc/logout.php');
         return $logouturl->out(false);
     }
 
@@ -243,5 +276,159 @@ class utils {
         global $CFG;
 
         return $CFG->dataroot . '/microsoft_certs';
+    }
+
+    /**
+     * Add a unique constraint on (oidcuniqid, tokenresource) to the auth_oidc_token table, removing duplicate
+     * tokens first.
+     *
+     * Removes duplicate tokens, keeping the latest one for each (oidcuniqid, tokenresource) pair.
+     * Uses a temporary table to work around MySQL error 1093 and PostgreSQL parameter limits.
+     *
+     * The index is created with the XMLDB API, so oidcuniqid must be short enough (200 characters) for the combined
+     * index with tokenresource to stay within xmldb_index::INDEX_COMPOSED_MAX_BYTES.
+     */
+    public static function add_token_unique_constraint(): void {
+        global $DB;
+
+        $dbman = $DB->get_manager();
+        $table = new \xmldb_table('auth_oidc_token');
+        $index = new \xmldb_index('authoidctoken_uniq_ix', XMLDB_INDEX_UNIQUE, ['oidcuniqid', 'tokenresource']);
+
+        if ($dbman->index_exists($table, $index)) {
+            // Unique constraint already present, nothing to do.
+            return;
+        }
+
+        // Deliberately let any failure here propagate: swallowing it would let the calling
+        // upgrade step reach its savepoint even though the uniqueness guarantee was never
+        // established, silently leaving the database inconsistent with the code.
+        $temptable = 'auth_oidc_token_keep_ids';
+
+        // Step 1: Create a temporary table with the IDs to keep.
+        $sql = "CREATE TEMPORARY TABLE {" . $temptable . "} (id INT PRIMARY KEY)";
+        $DB->execute($sql);
+
+        // Step 2: Insert the IDs to keep (latest token for each oidcuniqid, tokenresource pair).
+        $sql = "INSERT INTO {" . $temptable . "} (id)
+                SELECT MAX(id) FROM {auth_oidc_token}
+                GROUP BY oidcuniqid, tokenresource";
+        $DB->execute($sql);
+
+        // Step 3: Delete duplicates not in the temporary table.
+        $sql = "DELETE FROM {auth_oidc_token} WHERE id NOT IN (SELECT id FROM {" . $temptable . "})";
+        $DB->execute($sql);
+
+        // Step 4: Drop the temporary table (automatic on transaction end, but explicit for clarity).
+        // Note: PostgreSQL does not accept the TEMPORARY keyword in DROP TABLE (only in CREATE
+        // TABLE), so plain DROP TABLE is used here; it works for temporary tables on MySQL too.
+        $sql = "DROP TABLE IF EXISTS {" . $temptable . "}";
+        $DB->execute($sql);
+
+        // Step 5: Add unique constraint on (oidcuniqid, tokenresource) to prevent duplicate tokens.
+        $dbman->add_index($table, $index);
+    }
+
+    /**
+     * Migrate a site's selected stock icon if it used one of the icon choices that have been
+     * removed from the icon selector.
+     *
+     * The 'auth_oidc/icon' setting stores a "component:pix" identifier. The set of stock
+     * choices has been reduced to a handful of icons relevant to this plugin. A removed choice
+     * that has a direct Microsoft-branded replacement is remapped to it; any other removed
+     * choice was a generic core Moodle icon with no plugin-specific meaning and is reset to the
+     * plugin's default icon.
+     *
+     * Safe to call more than once: once a site's 'icon' setting is no longer one of the removed
+     * choices every subsequent call is a no-op.
+     */
+    public static function migrate_removed_icon_choices(): void {
+        $currenticon = get_config('auth_oidc', 'icon');
+        if (empty($currenticon)) {
+            return;
+        }
+
+        if (!empty(get_config('auth_oidc', 'customicon'))) {
+            // A custom icon is already in use and takes priority, so the stock icon setting is
+            // not currently affecting what is displayed. Nothing to migrate.
+            return;
+        }
+
+        // Icons that have simply been replaced with another stock icon: the choice was removed
+        // from the selector but a suitable replacement exists, so just point the setting at it.
+        $remappedicons = [
+            'auth_oidc:o365' => 'auth_oidc:office_365',
+            // The Microsoft 365 logo is now the single icon used for both Microsoft and Microsoft 365.
+            'auth_oidc:microsoft' => 'auth_oidc:microsoft_365',
+            'auth_oidc:microsoft_365_copilot' => 'auth_oidc:microsoft_365',
+        ];
+        if (isset($remappedicons[$currenticon])) {
+            set_config('icon', $remappedicons[$currenticon], 'auth_oidc');
+            return;
+        }
+
+        $keepicons = [
+            'auth_oidc:microsoft_365',
+            'auth_oidc:office_365',
+            'auth_oidc:openid',
+            'auth_oidc:keycloak',
+        ];
+        if (in_array($currenticon, $keepicons, true)) {
+            return;
+        }
+
+        // Every other removed choice was a generic core Moodle icon (a lock, an arrow, a
+        // person, ...) with no Microsoft-specific meaning. Core ships these as SVG only, and
+        // the custom icon file area deliberately rejects SVG (see
+        // AUTH_OIDC_CUSTOMICON_ALLOWED_EXTENSIONS in lib.php), so the original image cannot be
+        // preserved. Fall back to the plugin's default icon.
+        set_config('icon', 'auth_oidc:microsoft_365', 'auth_oidc');
+    }
+
+    /**
+     * Undo a custom login icon migration that produced an icon the login page cannot render.
+     *
+     * An earlier version of {@see self::migrate_removed_icon_choices()} copied the site's
+     * chosen core stock icon into the 'auth_oidc/customicon' file area. Core stock icons are
+     * SVG, which auth_oidc_initialize_customicon() refuses to publish to pix_plugins/ (see
+     * AUTH_OIDC_CUSTOMICON_ALLOWED_EXTENSIONS), so those sites are left with a 'customicon'
+     * setting that looks populated but shows an empty icon on the login page.
+     *
+     * This detects that state - a stored custom icon named 'migrated_*' whose extension is not
+     * one auth_oidc_initialize_customicon() can publish - clears it, removes any stale published
+     * file, and restores the default stock icon. It is a no-op on any other site.
+     */
+    public static function repair_failed_icon_migration(): void {
+        global $CFG, $DB;
+
+        require_once($CFG->dirroot . '/auth/oidc/lib.php');
+
+        $customicon = get_config('auth_oidc', 'customicon');
+        if (empty($customicon) || !preg_match('#^/migrated_.+\.([^.]+)$#', $customicon, $matches)) {
+            return;
+        }
+        if (in_array(strtolower($matches[1]), AUTH_OIDC_CUSTOMICON_ALLOWED_EXTENSIONS, true)) {
+            // The migrated icon uses a publishable format, so it renders correctly. Leave it be.
+            return;
+        }
+
+        $systemcontext = system::instance();
+        $fs = get_file_storage();
+
+        // Config and file writes are wrapped together so a later call still sees a consistent
+        // state (both cleared, or neither) if this fails partway through.
+        $transaction = $DB->start_delegated_transaction();
+        $fs->delete_area_files($systemcontext->id, 'auth_oidc', 'customicon', 0);
+        unset_config('customicon', 'auth_oidc');
+        set_config('icon', 'auth_oidc:microsoft_365', 'auth_oidc');
+        $transaction->allow_commit();
+
+        // Drop any icon that a previously-valid extension had published, then rebuild caches so
+        // the login page stops pointing at it.
+        $publishedicons = glob($CFG->dataroot . '/pix_plugins/auth/oidc/0/customicon.*');
+        foreach ($publishedicons ?: [] as $publishedicon) {
+            @unlink($publishedicon);
+        }
+        theme_reset_all_caches();
     }
 }

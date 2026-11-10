@@ -35,6 +35,7 @@ class mockoidcclient extends \auth_oidc\oidcclient {
     /** @var array Array of endpoints. */
     public $endpoints = [];
 
+    // phpcs:disable Generic.CodeAnalysis.UselessOverridingMethod.Found
     /**
      * Stub method to access protected parent method.
      *
@@ -45,11 +46,12 @@ class mockoidcclient extends \auth_oidc\oidcclient {
      * @return array Array of request parameters.
      */
     public function getauthrequestparams(
-            $promptlogin = false,
-            array $stateparams = [],
-            array $extraparams = [],
-            bool $selectaccount = false
+        $promptlogin = false,
+        array $stateparams = [],
+        array $extraparams = [],
+        bool $selectaccount = false
     ) {
-        return parent::getauthrequestparams($promptlogin, $stateparams);
+        return parent::getauthrequestparams($promptlogin, $stateparams, $extraparams, $selectaccount);
     }
+    // phpcs:enable Generic.CodeAnalysis.UselessOverridingMethod.Found
 }

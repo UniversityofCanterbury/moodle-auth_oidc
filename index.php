@@ -23,10 +23,34 @@
  * @copyright (C) 2014 onwards Microsoft, Inc. (http://microsoft.com/)
  */
 
+use core\context\system;
+use core\url;
+
 // phpcs:ignore moodle.Files.RequireLogin.Missing
-require_once(__DIR__.'/../../config.php');
-require_once(__DIR__.'/auth.php');
+require_once(__DIR__ . '/../../config.php');
+require_once(__DIR__ . '/auth.php');
 
 $auth = new \auth_plugin_oidc('authcode');
 $auth->set_httpclient(new \auth_oidc\httpclient());
-$auth->handleredirect();
+
+try {
+    $auth->handleredirect();
+} catch (moodle_exception $e) {
+    // Moodle's default handler shows the same message to unauthenticated users, so nothing extra is exposed here.
+    $errormessage = $e->getMessage();
+
+    $PAGE->set_url('/auth/oidc/');
+    $PAGE->set_context(system::instance());
+    $PAGE->set_pagelayout('login');
+    $PAGE->set_title(get_string('error'));
+
+    echo $OUTPUT->header();
+    echo $OUTPUT->notification($errormessage, 'error');
+    if (!empty($e->link)) {
+        echo $OUTPUT->single_button(new url($e->link), get_string('continue'), 'get');
+    } else {
+        echo $OUTPUT->single_button(new url('/login/index.php'), get_string('login'), 'get');
+    }
+    echo $OUTPUT->footer();
+    exit;
+}

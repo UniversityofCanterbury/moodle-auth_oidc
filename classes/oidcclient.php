@@ -26,7 +26,7 @@
 namespace auth_oidc;
 
 use moodle_exception;
-use moodle_url;
+use core\url;
 
 defined('MOODLE_INTERNAL') || die();
 
@@ -82,16 +82,7 @@ class oidcclient {
         if (!empty($tokenresource)) {
             $this->tokenresource = $tokenresource;
         } else {
-            if (auth_oidc_is_local_365_installed()) {
-                if (\local_o365\rest\o365api::use_chinese_api() === true) {
-                    $this->tokenresource = 'https://microsoftgraph.chinacloudapi.cn';
-                } else {
-                    $this->tokenresource = 'https://graph.microsoft.com';
-                }
-            } else {
-                $this->tokenresource = 'https://graph.microsoft.com';
-            }
-
+            $this->tokenresource = auth_oidc_get_graph_resource();
         }
         $this->scope = (!empty($scope)) ? $scope : 'openid profile email';
     }
@@ -166,6 +157,25 @@ class oidcclient {
     }
 
     /**
+     * Generate a PKCE code verifier (RFC 7636 section 4.1).
+     *
+     * @return string A random base64url string of 64 characters.
+     */
+    public static function generate_code_verifier(): string {
+        return rtrim(strtr(base64_encode(random_bytes(48)), '+/', '-_'), '=');
+    }
+
+    /**
+     * Derive the S256 PKCE code challenge from a code verifier (RFC 7636 section 4.2).
+     *
+     * @param string $codeverifier The code verifier.
+     * @return string The base64url-encoded SHA-256 hash of the verifier, without padding.
+     */
+    public static function get_code_challenge(string $codeverifier): string {
+        return rtrim(strtr(base64_encode(hash('sha256', $codeverifier, true)), '+/', '-_'), '=');
+    }
+
+    /**
      * Get an array of authorization request parameters.
      *
      * @param bool $promptlogin Whether to prompt for login or use existing session.
@@ -174,11 +184,20 @@ class oidcclient {
      * @param bool $selectaccount Whether to prompt the user to select an account.
      * @return array Array of request parameters.
      */
-    protected function getauthrequestparams($promptlogin = false, array $stateparams = [], array $extraparams = [],
-        bool $selectaccount = false) {
+    protected function getauthrequestparams(
+        $promptlogin = false,
+        array $stateparams = [],
+        array $extraparams = [],
+        bool $selectaccount = false
+    ) {
         global $SESSION;
 
-        $nonce = 'N'.uniqid();
+        $nonce = 'N' . uniqid();
+
+        $codeverifier = '';
+        if (get_config('auth_oidc', 'usepkce')) {
+            $codeverifier = static::generate_code_verifier();
+        }
 
         $params = [
             'response_type' => 'code',
@@ -186,11 +205,17 @@ class oidcclient {
             'scope' => $this->scope,
             'nonce' => $nonce,
             'response_mode' => 'form_post',
-            'state' => $this->getnewstate($nonce, $stateparams),
+            'state' => $this->getnewstate($nonce, $stateparams, $codeverifier),
             'redirect_uri' => $this->redirecturi,
         ];
 
-        if (get_config('auth_oidc', 'idptype') != AUTH_OIDC_IDP_TYPE_MICROSOFT_IDENTITY_PLATFORM) {
+        if ($codeverifier !== '') {
+            $params['code_challenge'] = static::get_code_challenge($codeverifier);
+            $params['code_challenge_method'] = 'S256';
+        }
+
+        $idptype = get_config('auth_oidc', 'idptype');
+        if (!in_array($idptype, [AUTH_OIDC_IDP_TYPE_MICROSOFT_IDENTITY_PLATFORM, AUTH_OIDC_IDP_TYPE_OTHER])) {
             $params['resource'] = $this->tokenresource;
         }
 
@@ -203,6 +228,8 @@ class oidcclient {
             $source = optional_param('source', '', PARAM_RAW);
             if ($silentloginmode && $source != 'loginpage') {
                 $params['prompt'] = 'none';
+            } else if (get_config('auth_oidc', 'forceselectaccount')) {
+                $params['prompt'] = 'select_account';
             }
         }
 
@@ -224,11 +251,11 @@ class oidcclient {
      * @return array
      */
     protected function getadminconsentrequestparams(array $stateparams = [], array $extraparams = []) {
-        $nonce = 'N'.uniqid();
+        $nonce = 'N' . uniqid();
 
         $params = [
             'client_id' => $this->clientid,
-            'scope' => 'https://graph.microsoft.com/.default',
+            'scope' => auth_oidc_get_graph_resource() . '/.default',
             'state' => $this->getnewstate($nonce, $stateparams),
             'redirect_uri' => $this->redirecturi,
         ];
@@ -243,16 +270,18 @@ class oidcclient {
      *
      * @param string $nonce The generated nonce value.
      * @param array $stateparams
+     * @param string $codeverifier The PKCE code verifier to keep until the authorization response is received.
      * @return string The new state value.
      */
-    protected function getnewstate($nonce, array $stateparams = []) {
+    protected function getnewstate($nonce, array $stateparams = [], string $codeverifier = '') {
         global $DB;
-        $staterec = new \stdClass;
+        $staterec = new \stdClass();
         $staterec->sesskey = sesskey();
         $staterec->state = random_string(15);
         $staterec->nonce = $nonce;
         $staterec->timecreated = time();
         $staterec->additionaldata = serialize($stateparams);
+        $staterec->codeverifier = $codeverifier;
         $DB->insert_record('auth_oidc_state', $staterec);
         return $staterec->state;
     }
@@ -265,8 +294,12 @@ class oidcclient {
      * @param array $extraparams Additional parameters to send with the OIDC request.
      * @param bool $selectaccount Whether to prompt the user to select an account.
      */
-    public function authrequest($promptlogin = false, array $stateparams = [], array $extraparams = [],
-        bool $selectaccount = false) {
+    public function authrequest(
+        $promptlogin = false,
+        array $stateparams = [],
+        array $extraparams = [],
+        bool $selectaccount = false
+    ) {
         if (empty($this->clientid)) {
             throw new moodle_exception('erroroidcclientnocreds', 'auth_oidc');
         }
@@ -276,7 +309,7 @@ class oidcclient {
         }
 
         $params = $this->getauthrequestparams($promptlogin, $stateparams, $extraparams, $selectaccount);
-        $redirecturl = new moodle_url($this->endpoints['auth'], $params);
+        $redirecturl = new url($this->endpoints['auth'], $params);
         redirect($redirecturl);
     }
 
@@ -288,57 +321,20 @@ class oidcclient {
      * @return void
      */
     public function adminconsentrequest(array $stateparams = [], array $extraparams = []) {
-        $adminconsentendpoint = 'https://login.microsoftonline.com/organizations/v2.0/adminconsent';
+        $adminconsentendpoint = auth_oidc_get_login_baseurl() . '/organizations/v2.0/adminconsent';
         $params = $this->getadminconsentrequestparams($stateparams, $extraparams);
-        $redirecturl = new moodle_url($adminconsentendpoint, $params);
+        $redirecturl = new url($adminconsentendpoint, $params);
         redirect($redirecturl);
-    }
-
-    /**
-     * Make a token request using the resource-owner credentials login flow.
-     *
-     * @param string $username The resource owner's username.
-     * @param string $password The resource owner's password.
-     * @return array Received parameters.
-     */
-    public function rocredsrequest($username, $password) {
-        if (empty($this->endpoints['token'])) {
-            throw new moodle_exception('erroroidcclientnotokenendpoint', 'auth_oidc');
-        }
-
-        if (strpos($this->endpoints['token'], 'https://') !== 0) {
-            throw new moodle_exception('erroroidcclientinsecuretokenendpoint', 'auth_oidc');
-        }
-
-        $params = [
-            'grant_type' => 'password',
-            'username' => $username,
-            'password' => $password,
-            'scope' => 'openid profile email',
-            'client_id' => $this->clientid,
-            'client_secret' => $this->clientsecret,
-        ];
-
-        if (get_config('auth_oidc', 'idptype') != AUTH_OIDC_IDP_TYPE_MICROSOFT_IDENTITY_PLATFORM) {
-            $params['resource'] = $this->tokenresource;
-        }
-
-        try {
-            $returned = $this->httpclient->post($this->endpoints['token'], $params);
-            return utils::process_json_response($returned, ['token_type' => null, 'id_token' => null]);
-        } catch (moodle_exception $e) {
-            utils::debug('Error in rocredsrequest request', __METHOD__, $e->getMessage());
-            return false;
-        }
     }
 
     /**
      * Exchange an authorization code for an access token.
      *
      * @param string $code An authorization code.
+     * @param string $codeverifier The PKCE code verifier used for the authorization request, if any.
      * @return array Received parameters.
      */
-    public function tokenrequest($code) {
+    public function tokenrequest($code, string $codeverifier = '') {
         if (empty($this->endpoints['token'])) {
             throw new moodle_exception('erroroidcclientnotokenendpoint', 'auth_oidc');
         }
@@ -349,6 +345,10 @@ class oidcclient {
             'code' => $code,
             'redirect_uri' => $this->redirecturi,
         ];
+
+        if ($codeverifier !== '') {
+            $params['code_verifier'] = $codeverifier;
+        }
 
         switch (get_config('auth_oidc', 'clientauthmethod')) {
             case AUTH_OIDC_AUTH_METHOD_CERTIFICATE:
@@ -371,7 +371,7 @@ class oidcclient {
     public function app_access_token_request() {
         $params = [
             'client_id' => $this->clientid,
-            'scope' => 'https://graph.microsoft.com/.default',
+            'scope' => auth_oidc_get_graph_resource() . '/.default',
             'grant_type' => 'client_credentials',
         ];
 

@@ -24,6 +24,8 @@
  * @copyright (C) 2014 onwards Microsoft, Inc. (http://microsoft.com/)
  */
 
+use auth_oidc\utils;
+
 defined('MOODLE_INTERNAL') || die();
 
 require_once($CFG->dirroot . '/auth/oidc/lib.php');
@@ -94,7 +96,7 @@ function xmldb_auth_oidc_upgrade($oldversion) {
 
                 // Populate token oidcusername.
                 if (empty($user->oidcusername)) {
-                    $updatedtoken = new stdClass;
+                    $updatedtoken = new stdClass();
                     $updatedtoken->id = $user->tokenid;
                     $updatedtoken->oidcusername = $oidcusername;
                     $DB->update_record('auth_oidc_token', $updatedtoken);
@@ -105,12 +107,12 @@ function xmldb_auth_oidc_upgrade($oldversion) {
                     // Old username, update to upn/sub.
                     if ($oidcusername != $user->username) {
                         // Update username.
-                        $updateduser = new stdClass;
+                        $updateduser = new stdClass();
                         $updateduser->id = $user->userid;
                         $updateduser->username = $oidcusername;
                         $DB->update_record('user', $updateduser);
 
-                        $updatedtoken = new stdClass;
+                        $updatedtoken = new stdClass();
                         $updatedtoken->id = $user->tokenid;
                         $updatedtoken->username = $oidcusername;
                         $DB->update_record('auth_oidc_token', $updatedtoken);
@@ -125,7 +127,7 @@ function xmldb_auth_oidc_upgrade($oldversion) {
 
     if ($oldversion < 2015012707) {
         if (!$dbman->table_exists('auth_oidc_prevlogin')) {
-            $dbman->install_one_table_from_xmldb_file(__DIR__.'/install.xml', 'auth_oidc_prevlogin');
+            $dbman->install_one_table_from_xmldb_file(__DIR__ . '/install.xml', 'auth_oidc_prevlogin');
         }
         upgrade_plugin_savepoint(true, 2015012707, 'auth', 'oidc');
     }
@@ -144,7 +146,7 @@ function xmldb_auth_oidc_upgrade($oldversion) {
         foreach ($authtokensrs as $authtokenrec) {
             $newusername = trim(\core_text::strtolower($authtokenrec->username));
             if ($newusername !== $authtokenrec->username) {
-                $updatedrec = new stdClass;
+                $updatedrec = new stdClass();
                 $updatedrec->id = $authtokenrec->id;
                 $updatedrec->username = $newusername;
                 $DB->update_record('auth_oidc_token', $updatedrec);
@@ -157,14 +159,22 @@ function xmldb_auth_oidc_upgrade($oldversion) {
         // Update old endpoints.
         $config = get_config('auth_oidc');
         if ($config->authendpoint === 'https://login.windows.net/common/oauth2/authorize') {
-            add_to_config_log('authendpoint', $config->authendpoint, 'https://login.microsoftonline.com/common/oauth2/authorize',
-                'auth_oidc');
+            add_to_config_log(
+                'authendpoint',
+                $config->authendpoint,
+                'https://login.microsoftonline.com/common/oauth2/authorize',
+                'auth_oidc'
+            );
             set_config('authendpoint', 'https://login.microsoftonline.com/common/oauth2/authorize', 'auth_oidc');
         }
 
         if ($config->tokenendpoint === 'https://login.windows.net/common/oauth2/token') {
-            add_to_config_log('tokenendpoint', $config->tokenendpoint, 'https://login.microsoftonline.com/common/oauth2/token',
-                'auth_oidc');
+            add_to_config_log(
+                'tokenendpoint',
+                $config->tokenendpoint,
+                'https://login.microsoftonline.com/common/oauth2/token',
+                'auth_oidc'
+            );
             set_config('tokenendpoint', 'https://login.microsoftonline.com/common/oauth2/token', 'auth_oidc');
         }
 
@@ -181,7 +191,7 @@ function xmldb_auth_oidc_upgrade($oldversion) {
                       JOIN {user} u ON u.username = tok.username';
             $records = $DB->get_recordset_sql($sql);
             foreach ($records as $record) {
-                $newrec = new stdClass;
+                $newrec = new stdClass();
                 $newrec->id = $record->id;
                 $newrec->userid = $record->userid;
                 $DB->update_record('auth_oidc_token', $newrec);
@@ -399,10 +409,10 @@ function xmldb_auth_oidc_upgrade($oldversion) {
                         $existingidptype = get_config('auth_oidc', 'idptype');
                         if ($existinglocksetting != AUTH_OIDC_IDP_TYPE_MICROSOFT_IDENTITY_PLATFORM) {
                             add_to_config_log(
-                                    'idptype',
-                                    $existingidptype,
-                                    AUTH_OIDC_IDP_TYPE_MICROSOFT_IDENTITY_PLATFORM,
-                                    'auth_oidc'
+                                'idptype',
+                                $existingidptype,
+                                AUTH_OIDC_IDP_TYPE_MICROSOFT_IDENTITY_PLATFORM,
+                                'auth_oidc'
                             );
                         }
                         set_config('idptype', AUTH_OIDC_IDP_TYPE_MICROSOFT_IDENTITY_PLATFORM, 'auth_oidc');
@@ -426,8 +436,12 @@ function xmldb_auth_oidc_upgrade($oldversion) {
             if (empty($clientsecretconfig) && !empty($clientcertificateconfig) && !empty($clientprivatekeyconfig)) {
                 $existingclientauthmethod = get_config('auth_oidc', 'clientauthmethod');
                 if ($existingclientauthmethod != AUTH_OIDC_AUTH_METHOD_CERTIFICATE) {
-                    add_to_config_log('clientauthmethod', $existingclientauthmethod, AUTH_OIDC_AUTH_METHOD_CERTIFICATE,
-                        'auth_oidc');
+                    add_to_config_log(
+                        'clientauthmethod',
+                        $existingclientauthmethod,
+                        AUTH_OIDC_AUTH_METHOD_CERTIFICATE,
+                        'auth_oidc'
+                    );
                 }
                 set_config('clientauthmethod', AUTH_OIDC_AUTH_METHOD_CERTIFICATE, 'auth_oidc');
             } else {
@@ -553,6 +567,196 @@ function xmldb_auth_oidc_upgrade($oldversion) {
 
         // Oidc savepoint reached.
         upgrade_plugin_savepoint(true, 2024100702, 'auth', 'oidc');
+    }
+
+    if ($oldversion < 2024100720.01) {
+        // Define index to be added to auth_oidc_token.
+        $table = new xmldb_table('auth_oidc_token');
+        $index = new xmldb_index('oidcusername', XMLDB_INDEX_NOTUNIQUE, ['oidcusername']);
+
+        // Conditionally launch add index oidcusername.
+        if (!$dbman->index_exists($table, $index)) {
+            $dbman->add_index($table, $index);
+        }
+
+        // Oidc savepoint reached.
+        upgrade_plugin_savepoint(true, 2024100720.01, 'auth', 'oidc');
+    }
+
+    if ($oldversion < 2024100730.01) {
+        // The unique constraint on (oidcuniqid, tokenresource) is created by the 2024100740.06 step below, once
+        // oidcuniqid has been shortened: at its original length the index is rejected by the XMLDB API.
+        upgrade_plugin_savepoint(true, 2024100730.01, 'auth', 'oidc');
+    }
+
+    if ($oldversion < 2024100735.01) {
+        // The rocreds (Resource Owner Password Credentials Grant) login flow has been removed.
+        // Reset any site still configured to use it back to the authcode flow.
+        if (get_config('auth_oidc', 'loginflow') === 'rocreds') {
+            set_config('loginflow', 'authcode', 'auth_oidc');
+        }
+
+        upgrade_plugin_savepoint(true, 2024100735.01, 'auth', 'oidc');
+    }
+
+    if ($oldversion < 2024100735.02) {
+        // The unique constraint on (oidcuniqid, tokenresource) is created by the 2024100740.06 step below, once
+        // oidcuniqid has been shortened: at its original length the index is rejected by the XMLDB API.
+        upgrade_plugin_savepoint(true, 2024100735.02, 'auth', 'oidc');
+    }
+
+    if ($oldversion < 2024100735.04) {
+        // Widen the sid field on auth_oidc_sid: it stores the session_state parameter, which can
+        // exceed 36 characters (e.g. two GUIDs joined by a dot), not a fixed-length identifier.
+        $table = new xmldb_table('auth_oidc_sid');
+        $field = new xmldb_field('sid', XMLDB_TYPE_CHAR, '255', null, XMLDB_NOTNULL, null, null, 'userid');
+        $index = new xmldb_index('sid', XMLDB_INDEX_NOTUNIQUE, ['sid']);
+
+        if ($dbman->field_exists($table, $field)) {
+            // The sid index depends on this field, so the DDL layer refuses to alter it in
+            // place (ddl_dependency_exception); drop the index first and recreate it once the
+            // field has been widened.
+            if ($dbman->index_exists($table, $index)) {
+                $dbman->drop_index($table, $index);
+            }
+
+            $dbman->change_field_precision($table, $field);
+
+            if (!$dbman->index_exists($table, $index)) {
+                $dbman->add_index($table, $index);
+            }
+        }
+
+        // Oidc savepoint reached.
+        upgrade_plugin_savepoint(true, 2024100735.04, 'auth', 'oidc');
+    }
+
+    if ($oldversion < 2024100735.05) {
+        \auth_oidc\utils::migrate_removed_icon_choices();
+        upgrade_plugin_savepoint(true, 2024100735.05, 'auth', 'oidc');
+    }
+
+    if ($oldversion < 2024100735.06) {
+        // Define field sessionid to be added to auth_oidc_sid.
+        $table = new xmldb_table('auth_oidc_sid');
+        $field = new xmldb_field('sessionid', XMLDB_TYPE_CHAR, '128', null, null, null, null, 'timecreated');
+
+        // Conditionally launch add field sessionid.
+        if (!$dbman->field_exists($table, $field)) {
+            $dbman->add_field($table, $field);
+        }
+
+        // Define index sid to be added to auth_oidc_sid.
+        $index = new xmldb_index('sid', XMLDB_INDEX_NOTUNIQUE, ['sid']);
+
+        // Conditionally launch add index sid.
+        if (!$dbman->index_exists($table, $index)) {
+            $dbman->add_index($table, $index);
+        }
+
+        // Define field iss to be added to auth_oidc_sid.
+        $table = new xmldb_table('auth_oidc_sid');
+        $field = new xmldb_field('iss', XMLDB_TYPE_CHAR, '255', null, null, null, null, 'sessionid');
+
+        // Conditionally launch add field iss.
+        if (!$dbman->field_exists($table, $field)) {
+            $dbman->add_field($table, $field);
+        }
+
+        // Oidc savepoint reached.
+        upgrade_plugin_savepoint(true, 2024100735.06, 'auth', 'oidc');
+    }
+
+    if ($oldversion < 2024100735.08) {
+        \auth_oidc\utils::migrate_removed_icon_choices();
+        upgrade_plugin_savepoint(true, 2024100735.08, 'auth', 'oidc');
+    }
+
+    if ($oldversion < 2024100740.02) {
+        \auth_oidc\utils::repair_failed_icon_migration();
+        upgrade_plugin_savepoint(true, 2024100740.02, 'auth', 'oidc');
+    }
+
+    if ($oldversion < 2024100740.04) {
+        // The Microsoft cloud setting replaces the "Microsoft 365 for China" setting of local_o365.
+        if (get_config('auth_oidc', 'microsoftcloud') === false) {
+            $chineseapi = get_config('local_o365', 'chineseapi');
+            set_config(
+                'microsoftcloud',
+                !empty($chineseapi) ? AUTH_OIDC_MICROSOFT_CLOUD_CHINA : AUTH_OIDC_MICROSOFT_CLOUD_GLOBAL,
+                'auth_oidc'
+            );
+        }
+
+        upgrade_plugin_savepoint(true, 2024100740.04, 'auth', 'oidc');
+    }
+
+    if ($oldversion < 2024100740.05) {
+        // The login flow and auto-append settings only applied to the removed rocreds login flow.
+        unset_config('loginflow', 'auth_oidc');
+        unset_config('autoappend', 'auth_oidc');
+
+        upgrade_plugin_savepoint(true, 2024100740.05, 'auth', 'oidc');
+    }
+
+    if ($oldversion < 2024100740.06) {
+        $table = new xmldb_table('auth_oidc_token');
+        $field = new xmldb_field('oidcuniqid', XMLDB_TYPE_CHAR, '200', null, XMLDB_NOTNULL, null, null, 'id');
+        $singleindex = new xmldb_index('oidcuniqid', XMLDB_INDEX_NOTUNIQUE, ['oidcuniqid']);
+        $uniqueindex = new xmldb_index('authoidctoken_uniq_ix', XMLDB_INDEX_UNIQUE, ['oidcuniqid', 'tokenresource']);
+
+        // Shortening the field would fail or truncate values longer than the new length, so refuse to continue.
+        if ($dbman->field_exists($table, new xmldb_field('oidcuniqid'))) {
+            $select = $DB->sql_length('oidcuniqid') . ' > 200';
+            if ($DB->record_exists_select('auth_oidc_token', $select)) {
+                throw new moodle_exception('upgradeoidcuniqidtoolong', 'auth_oidc');
+            }
+        }
+
+        // The field length change is blocked while the old single-column index still exists.
+        if ($dbman->index_exists($table, $singleindex)) {
+            $dbman->drop_index($table, $singleindex);
+        }
+
+        // The raw SQL unique index also depends on the field length in the same way.
+        if ($dbman->index_exists($table, $uniqueindex)) {
+            $dbman->drop_index($table, $uniqueindex);
+        }
+
+        if ($dbman->field_exists($table, new xmldb_field('oidcuniqid'))) {
+            $dbman->change_field_precision($table, $field);
+        }
+
+        if (!$dbman->index_exists($table, $singleindex)) {
+            $dbman->add_index($table, $singleindex);
+        }
+
+        // Recreate the unique composite index after the field length change.
+        if (!$dbman->index_exists($table, $uniqueindex)) {
+            utils::add_token_unique_constraint();
+        }
+
+        upgrade_plugin_savepoint(true, 2024100740.06, 'auth', 'oidc');
+    }
+
+    if ($oldversion < 2024100740.07) {
+        // Define field codeverifier to be added to auth_oidc_state.
+        $table = new xmldb_table('auth_oidc_state');
+        $field = new xmldb_field('codeverifier', XMLDB_TYPE_CHAR, '128', null, null, null, null, 'additionaldata');
+
+        // Conditionally launch add field codeverifier.
+        if (!$dbman->field_exists($table, $field)) {
+            $dbman->add_field($table, $field);
+        }
+
+        // Keep the existing behaviour for providers that are not Microsoft ones; enable PKCE for Microsoft ones.
+        if (get_config('auth_oidc', 'usepkce') === false) {
+            $idptype = get_config('auth_oidc', 'idptype');
+            set_config('usepkce', $idptype == AUTH_OIDC_IDP_TYPE_OTHER ? 0 : 1, 'auth_oidc');
+        }
+
+        // Oidc savepoint reached.
+        upgrade_plugin_savepoint(true, 2024100740.07, 'auth', 'oidc');
     }
 
     return true;

@@ -23,14 +23,17 @@
  * @copyright (C) 2014 onwards Microsoft, Inc. (http://microsoft.com/)
  */
 
+use core\context\system;
+use core\url;
+
 require_once(__DIR__ . '/../../config.php');
 require_once($CFG->libdir . '/adminlib.php');
 require_once($CFG->dirroot . '/auth/oidc/lib.php');
 
 require_login();
 
-$context = context_system::instance();
-$pageurl = new moodle_url('/auth/oidc/cleanupoidctokens.php');
+$context = system::instance();
+$pageurl = new url('/auth/oidc/cleanupoidctokens.php');
 
 admin_externalpage_setup('auth_oidc_cleanup_oidc_tokens');
 
@@ -47,12 +50,13 @@ $mismatchedtokens = auth_oidc_get_tokens_with_mismatched_usernames();
 
 $tokenstoclean = $emptyuseridtokens + $mismatchedtokens;
 
-uasort($tokenstoclean, function($a, $b) {
+uasort($tokenstoclean, function ($a, $b) {
     return strcmp($a->oidcusername, $b->oidcusername);
 });
 
 $deletetokenid = optional_param('id', 0, PARAM_INT);
 if ($deletetokenid) {
+    require_sesskey();
     if (array_key_exists($deletetokenid, $tokenstoclean)) {
         auth_oidc_delete_token($deletetokenid);
 
@@ -86,9 +90,9 @@ if ($tokenstoclean) {
     foreach ($tokenstoclean as $item) {
         $table->data[] = [
             $item->id,
-            $item->oidcusername,
-            $item->useridentifier,
-            $item->oidcuniqueid,
+            s($item->oidcusername),
+            s($item->useridentifier),
+            s($item->oidcuniqueid),
             $item->matchingstatus,
             $item->details,
             $item->action,
@@ -97,6 +101,7 @@ if ($tokenstoclean) {
 }
 
 echo $OUTPUT->header();
+echo auth_oidc_get_settings_nav_html('auth_oidc_other_settings', get_string('settings_page_cleanup_oidc_tokens', 'auth_oidc'));
 
 if ($tokenstoclean) {
     echo html_writer::table($table);

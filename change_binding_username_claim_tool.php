@@ -27,16 +27,19 @@ use auth_oidc\form\change_binding_username_claim_tool_form1;
 use auth_oidc\form\change_binding_username_claim_tool_form2;
 use auth_oidc\preview;
 use auth_oidc\process;
+use core\context\system;
+use core\url;
 
 require_once(dirname(__FILE__) . '/../../config.php');
 require_once($CFG->libdir . '/adminlib.php');
 require_once($CFG->libdir . '/csvlib.class.php');
+require_once($CFG->dirroot . '/auth/oidc/lib.php');
 
 require_login();
 
-$url = new moodle_url('/auth/oidc/change_binding_username_claim_tool.php');
+$url = new url('/auth/oidc/change_binding_username_claim_tool.php');
 $PAGE->set_url($url);
-$PAGE->set_context(context_system::instance());
+$PAGE->set_context(system::instance());
 $PAGE->set_pagelayout('admin');
 $PAGE->set_heading(get_string('settings_page_change_binding_username_claim_tool', 'auth_oidc'));
 $PAGE->set_title(get_string('settings_page_change_binding_username_claim_tool', 'auth_oidc'));
@@ -68,11 +71,12 @@ if (empty($iid)) {
         }
     } else {
         echo $OUTPUT->header();
+        echo auth_oidc_get_settings_nav_html(
+            'auth_oidc_binding_username_claim',
+            get_string('settings_page_change_binding_username_claim_tool', 'auth_oidc')
+        );
 
-        echo $OUTPUT->heading(get_string('change_binding_username_claim_tool', 'auth_oidc'));
-        $bindingusernameclaimurl = new moodle_url('/auth/oidc/binding_username_claim.php');
-        echo html_writer::tag('p', get_string('change_binding_username_claim_tool_description', 'auth_oidc',
-            $bindingusernameclaimurl->out()));
+        echo get_string('change_binding_username_claim_tool_description', 'auth_oidc');
 
         $form1->display();
 
@@ -87,8 +91,10 @@ if (empty($iid)) {
 $process = new process($cir);
 $filecolumns = $process->get_file_columns();
 
-$mform2 = new change_binding_username_claim_tool_form2(null,
-    ['columns' => $filecolumns, 'data' => ['iid' => $iid, 'previewrows' => $previewrows]]);
+$mform2 = new change_binding_username_claim_tool_form2(
+    null,
+    ['columns' => $filecolumns, 'data' => ['iid' => $iid, 'previewrows' => $previewrows]]
+);
 
 // If a file has been uploaded, then process it.
 if ($mform2->is_cancelled()) {
@@ -97,7 +103,11 @@ if ($mform2->is_cancelled()) {
 } else if ($formdata = $mform2->get_data()) {
     // Print the header.
     echo $OUTPUT->header();
-    echo $OUTPUT->heading(get_string('change_binding_username_claim_tool_result', 'auth_oidc'));
+    echo auth_oidc_get_settings_nav_html(
+        'auth_oidc_binding_username_claim',
+        get_string('settings_page_change_binding_username_claim_tool', 'auth_oidc')
+    );
+    echo $OUTPUT->heading(get_string('change_binding_username_claim_tool_result', 'auth_oidc'), 3);
 
     $process->set_form_data($formdata);
     $process->process();
@@ -112,8 +122,10 @@ if ($mform2->is_cancelled()) {
 
 // Print the header.
 echo $OUTPUT->header();
-
-echo $OUTPUT->heading(get_string('change_binding_username_claim_tool', 'auth_oidc'));
+echo auth_oidc_get_settings_nav_html(
+    'auth_oidc_binding_username_claim',
+    get_string('settings_page_change_binding_username_claim_tool', 'auth_oidc')
+);
 
 $table = new preview($cir, $filecolumns, $previewrows);
 
